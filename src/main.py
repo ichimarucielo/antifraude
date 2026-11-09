@@ -1,32 +1,26 @@
 from __future__ import annotations
+
+import argparse
 import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-import pandas as pd
-from rules import build_child_final, classify_dirty
-import argparse
+from tempfile import TemporaryDirectory
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+import pandas as pd
+
+from rules import build_child_final, classify_dirty
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-
 INPUT_FOLDER = BASE_DIR / "data" / "original"
 WORK_FOLDER = BASE_DIR / "data" / "trabalho"
 OUTPUT_FOLDER = BASE_DIR / "data" / "final"
 
-WORK_FOLDER.mkdir(parents=True, exist_ok=True)
-OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
-
-
-UNUSED_COLUMNS = {
-    "Payment Volume",
-    "Rate - %",
-}
+UNUSED_COLUMNS = ["Payment Volume", "Rate - %"]
+DUPLICATE_KEY = ["Invoice Number", "Child", "Product Description"]
+REQUIRED_COLUMNS = {*DUPLICATE_KEY, "MID", "Total Amount Due"}
+AUDIT_COLUMNS = ["child_original", "mid_original", "process_date"]
 
 
 @dataclass(slots=True)
@@ -38,255 +32,109 @@ class PipelineResult:
 
 
 def get_input_file() -> Path:
-    files = sorted(
-        INPUT_FOLDER.glob("*.xlsx")
-    )
-
+    files = sorted(path for path in INPUT_FOLDER.glob("*.xlsx") if not path.name.startswith("~$"))
     if not files:
-        raise FileNotFoundError(
-            f"Nenhum arquivo encontrado em: {INPUT_FOLDER}"
-        )
-
-    logging.info(
-        "Arquivo encontrado: %s",
-        files[0].name,
-    )
-
+        raise FileNotFoundError(f"Nenhum arquivo .xlsx encontrado em {INPUT_FOLDER}")
+    if len(files) > 1:
+        raise ValueError(f"Há mais de um arquivo em {INPUT_FOLDER}. Informe --input-file.")
     return files[0]
 
 
-def load_data(
-    file_path: Path,
-) -> pd.DataFrame:
-    logging.info(
-        "Lendo arquivo: %s",
-        file_path,
-    )
+def process_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    missing = REQUIRED_COLUMNS.difference(df.columns)
+    if missing:
+        raise ValueError(f"Colunas obrigatórias ausentes: {', '.join(sorted(missing))}")
 
-    return pd.read_excel(
-        file_path,
-        engine="openpyxl",
-    )
+    df = df.drop(columns=UNUSED_COLUMNS, errors="ignore")
+    treated_rows = []
+    dirty_rows = []
+    process_date = datetime.now()
 
-
-def drop_unused_columns(
-    df: pd.DataFrame,
-) -> pd.DataFrame:
-    return df.drop(
-        columns=[
-            column
-            for column in UNUSED_COLUMNS
-            if column in df.columns
-        ],
-        errors="ignore",
-    )
-
-
-def process_dataframe(
-    df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    valid_rows: list[pd.Series] = []
-    dirty_rows: list[pd.Series] = []
-
-    for _, row in df.iterrows():
-        child = row.get("Child", "")
-        mid = row.get("MID", "")
-        product_description = row.get(
-            "Product Description",
-            "",
-        )
-        amount = row.get(
-            "Total Amount Due",
-            0,
-        )
-
-        is_dirty, reason = classify_dirty(
-            child=child,
-            mid=mid,
-            total_amount_due=amount,
-        )
+    for row in df.to_dict(orient="records"):
+        child = row["Child"]
+        mid = row["MID"]
+        is_dirty, reason = classify_dirty(child, mid, row["Total Amount Due"])
+        if not is_dirty:
+            child_final = build_child_final(child, row["Product Description"])
+            if child_final in {"braspag", "braspag_"}:
+                is_dirty, reason = True, "child_invalido"
 
         if is_dirty:
-            dirty_row = row.copy()
-            dirty_row["motivo_sujeira"] = reason
-
-            dirty_rows.append(
-                dirty_row
-            )
-
+            dirty_rows.append({**row, "motivo_sujeira": reason})
             continue
 
-        child_final = build_child_final(
-            child=child,
-            product_description=product_description,
-        )
-
-        valid_row = row.copy()
-
-        valid_row["child_original"] = child
-        valid_row["mid_original"] = mid
-
-        valid_row["Child"] = child_final
-        valid_row["MID"] = child_final
-
-        valid_row["process_date"] = datetime.now()
-
-        valid_rows.append(
-            valid_row
-        )
+        treated_rows.append({
+            **row,
+            "Child": child_final,
+            "MID": child_final,
+            "child_original": child,
+            "mid_original": mid,
+            "process_date": process_date,
+        })
 
     return (
-        pd.DataFrame(valid_rows),
-        pd.DataFrame(dirty_rows),
+        pd.DataFrame(treated_rows, columns=[*df.columns, *AUDIT_COLUMNS]),
+        pd.DataFrame(dirty_rows, columns=[*df.columns, "motivo_sujeira"]),
     )
 
 
-def save_workbook(
-    treated_df: pd.DataFrame,
-    dirty_df: pd.DataFrame,
-) -> None:
-    output_file = (
-        WORK_FOLDER
-        / "antifraude_trabalho.xlsx"
-    )
-
-    with pd.ExcelWriter(
-        output_file,
-        engine="openpyxl",
-    ) as writer:
-        treated_df.to_excel(
-            writer,
-            sheet_name="TRATADO",
-            index=False,
-        )
-
-        dirty_df.to_excel(
-            writer,
-            sheet_name="SUJEIRA",
-            index=False,
-        )
-
-    logging.info(
-        "Workbook trabalho criado: %s",
-        output_file,
-    )
+def find_duplicate_candidates(treated: pd.DataFrame) -> pd.DataFrame:
+    candidates = treated.loc[treated.duplicated(DUPLICATE_KEY, keep=False)].copy()
+    candidates["ocorrencias_chave"] = candidates.groupby(
+        DUPLICATE_KEY, dropna=False
+    )["Child"].transform("size")
+    return candidates
 
 
-def save_vf(
-    treated_df: pd.DataFrame,
-    dirty_df: pd.DataFrame,
-) -> None:
-    output_file = (
-        OUTPUT_FOLDER
-        / "antifraude_vf.xlsx"
-    )
+def write_workbook(path: Path, sheets: dict[str, pd.DataFrame]) -> None:
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        for name, sheet in sheets.items():
+            sheet.to_excel(writer, sheet_name=name, index=False)
 
-    with pd.ExcelWriter(
-        output_file,
-        engine="openpyxl",
-    ) as writer:
-        treated_df.to_excel(
-            writer,
-            sheet_name="BASE_COMPLETA",
-            index=False,
-        )
 
-        pd.DataFrame().to_excel(
-            writer,
-            sheet_name="CHECK_DUPLICIDADE",
-            index=False,
-        )
+def run_pipeline(input_file: Path | None = None) -> PipelineResult:
+    input_file = input_file if input_file is not None else get_input_file()
+    work_file = WORK_FOLDER / "antifraude_trabalho.xlsx"
+    final_file = OUTPUT_FOLDER / "antifraude_vf.xlsx"
+    if input_file.resolve() in {work_file.resolve(), final_file.resolve()}:
+        raise ValueError("O arquivo de entrada deve ser diferente dos arquivos de saída.")
 
-        dirty_df.to_excel(
-            writer,
-            sheet_name="SUJEIRA",
-            index=False,
-        )
+    logging.info("Lendo %s", input_file)
+    df = pd.read_excel(input_file, engine="openpyxl")
+    treated, dirty = process_dataframe(df)
+    duplicates = find_duplicate_candidates(treated)
 
-    logging.info(
-        "VF criada: %s",
-        output_file,
-    )
+    WORK_FOLDER.mkdir(parents=True, exist_ok=True)
+    OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
+    # Grava ambos os arquivos antes de substituir as saídas existentes.
+    with TemporaryDirectory(dir=WORK_FOLDER) as work_dir, TemporaryDirectory(dir=OUTPUT_FOLDER) as final_dir:
+        work_tmp = Path(work_dir) / work_file.name
+        final_tmp = Path(final_dir) / final_file.name
+        write_workbook(work_tmp, {"TRATADO": treated, "SUJEIRA": dirty})
+        write_workbook(final_tmp, {
+            "BASE_COMPLETA": treated,
+            "CHECK_DUPLICIDADE": duplicates,
+            "SUJEIRA": dirty,
+        })
+        work_tmp.replace(work_file)
+        final_tmp.replace(final_file)
 
-def get_arguments():
-
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--input-file",
-        required=False,
-    )
-
-    return parser.parse_args()
-
-def run_pipeline(
-    input_file: Path | None = None,
-) -> PipelineResult:
-
-    file_path = (
-        input_file
-        if input_file
-        else get_input_file()
-    )
-
-    df = load_data(
-        file_path
-    )
-
-    logging.info(
-        "Registros carregados: %s",
-        len(df),
-    )
-
-    treated_df, dirty_df = process_dataframe(
-        df
-    )
-
-    treated_df = drop_unused_columns(
-        treated_df
-    )
-
-    dirty_df = drop_unused_columns(
-        dirty_df
-    )
-
-    save_workbook(
-        treated_df=treated_df,
-        dirty_df=dirty_df,
-    )
-
-    save_vf(
-        treated_df=treated_df,
-        dirty_df=dirty_df,
-    )
-
-    return PipelineResult(
-        total_rows=len(df),
-        valid_rows=len(treated_df),
-        dirty_rows=len(dirty_df),
-        success=True,
-    )
+    logging.info("Linhas em CHECK_DUPLICIDADE: %s", len(duplicates))
+    return PipelineResult(len(df), len(treated), len(dirty), True)
 
 
 def main() -> None:
-
-    args = get_arguments()
-
-    input_file = (
-        Path(args.input_file)
-        if args.input_file
-        else None
-    )
-
-    result = run_pipeline(
-        input_file=input_file
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    parser = argparse.ArgumentParser(description="Prepara a base mensal de faturamento antifraude.")
+    parser.add_argument("--input-file", type=Path, help="Arquivo Excel de origem.")
+    args = parser.parse_args()
+    try:
+        result = run_pipeline(args.input_file)
+    except (OSError, ValueError) as exc:
+        parser.exit(1, f"Erro: {exc}\n")
 
     logging.info(
-        "Pipeline concluída | "
-        "Total=%s | "
-        "Validos=%s | "
-        "Sujeira=%s",
+        "Pipeline concluído | Total=%s | Válidos=%s | Sujeira=%s",
         result.total_rows,
         result.valid_rows,
         result.dirty_rows,

@@ -1,39 +1,28 @@
-from pathlib import Path
+import unittest
 
-import pandas as pd
-
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-
-VF_FILE = (
-    BASE_DIR
-    / "data"
-    / "final_concreto"
-    / "Antifraude - Jul26 - VF.xlsx"
-)
+from rules import build_child_final, classify_dirty
 
 
-def main() -> None:
-    workbook = pd.read_excel(
-        VF_FILE,
-        sheet_name=None,
-        engine="openpyxl",
-    )
+class RulesTest(unittest.TestCase):
+    def test_normalization(self):
+        for child, product, expected in [
+            ("  BANESE1 ", "", "braspag_banese1"),
+            ("braspag_3ds20", "", "braspag_3ds20"),
+            (" Loja_123 ", "", "braspag_loja"),
+            ("loja alelo", "Non-Visa", "braspag_alelo"),
+            ("loja alelo", "Enterprise", "braspag_alelo_enterprise"),
+            ("loja amway", "", "braspag_amway"),
+        ]:
+            with self.subTest(child=child, product=product):
+                self.assertEqual(build_child_final(child, product), expected)
+                self.assertEqual(build_child_final(expected, product), expected)
 
-    print("\nABAS:")
-    for sheet_name, df in workbook.items():
-        print(
-            f"{sheet_name} | "
-            f"linhas={len(df)} | "
-            f"colunas={len(df.columns)}"
-        )
+    def test_invalid_amounts(self):
+        for amount in (None, "", "erro", 0, -1, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(amount=amount):
+                self.assertEqual(classify_dirty("loja", "", amount), (True, "amount_invalido"))
 
-    print("\n" + "=" * 100)
-
-    for sheet_name, df in workbook.items():
-        print(f"\nABA: {sheet_name}")
-        print(df.head(5).to_string())
-
-
-if __name__ == "__main__":
-    main()
+    def test_missing_child_and_stelo(self):
+        self.assertEqual(classify_dirty(float("nan"), "loja", 1), (True, "child_ausente"))
+        self.assertEqual(classify_dirty("Stelo", "stelo_teste", 1), (True, "stelo_teste"))
+        self.assertEqual(classify_dirty("loja", None, 1), (False, ""))

@@ -1,197 +1,56 @@
-from __future__ import annotations
-
 from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-
-VF_FILE = (
-    BASE_DIR
-    / "data"
-    / "final_concreto"
-    / "Antifraude - Jul26 - VF.xlsx"
-)
+import main
 
 
-def load_sheets() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    workbook = pd.read_excel(
-        VF_FILE,
-        sheet_name=None,
-        engine="openpyxl",
-    )
+class ReconciliationTest(unittest.TestCase):
+    def test_pipeline_preserves_rows_and_totals(self):
+        df = pd.DataFrame({
+            "Invoice Number": ["INV"] * 5,
+            "Child": ["Loja1", "Loja2", "Outra", "Loja", "123"],
+            "MID": ["mid-a", "mid-b", "mid-c", "mid-d", "mid-e"],
+            "Product Description": [None] * 5,
+            "Total Amount Due": [10, 20, -2, None, 5],
+            "Payment Volume": [0] * 5,
+        })
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "input.xlsx"
+            df.to_excel(source, engine="openpyxl", index=False)
+            with patch.multiple(main, WORK_FOLDER=root / "work", OUTPUT_FOLDER=root / "final"):
+                result = main.run_pipeline(source)
+            work = pd.read_excel(root / "work/antifraude_trabalho.xlsx", sheet_name=None)
+            final = pd.read_excel(root / "final/antifraude_vf.xlsx", sheet_name=None)
 
-    base_df = workbook["Base completa - Jul26"]
-
-    ajustes_df = workbook["Ajustes Jul26"]
-
-    sujeira_df = workbook["Sujeira  - avaliar"]
-
-    return base_df, ajustes_df, sujeira_df
-
-
-def build_key(df: pd.DataFrame) -> pd.DataFrame:
-    result = df.copy()
-
-    result["_key"] = (
-        result["Invoice Number"].astype(str)
-        + "|"
-        + result["Child"].astype(str)
-        + "|"
-        + result["Product Description"].astype(str)
-    )
-
-    return result
-
-
-def analyze_counts(
-    base_df: pd.DataFrame,
-    ajustes_df: pd.DataFrame,
-    sujeira_df: pd.DataFrame,
-) -> None:
-    print("\n" + "=" * 100)
-    print("CONTAGENS")
-    print("=" * 100)
-
-    print(f"Base Completa : {len(base_df):,}")
-    print(f"Ajustes       : {len(ajustes_df):,}")
-    print(f"Sujeira       : {len(sujeira_df):,}")
-
-    print(
-        f"\nDiferença Ajustes -> Base: "
-        f"{len(ajustes_df) - len(base_df):,}"
-    )
-
-
-def analyze_nulls(
-    ajustes_df: pd.DataFrame,
-) -> None:
-    print("\n" + "=" * 100)
-    print("NULLS")
-    print("=" * 100)
-
-    if "MID" in ajustes_df.columns:
-        print(
-            f"MID nulo: "
-            f"{ajustes_df['MID'].isna().sum():,}"
+        self.assertEqual(result, main.PipelineResult(5, 2, 3, True))
+        base, candidates, dirty = (final[name] for name in (
+            "BASE_COMPLETA", "CHECK_DUPLICIDADE", "SUJEIRA"
+        ))
+        pd.testing.assert_frame_equal(base, work["TRATADO"])
+        pd.testing.assert_frame_equal(dirty, work["SUJEIRA"])
+        self.assertEqual(base["MID"].tolist(), ["braspag_loja"] * 2)
+        self.assertEqual(base["mid_original"].tolist(), ["mid-a", "mid-b"])
+        self.assertEqual(candidates["ocorrencias_chave"].tolist(), [2, 2])
+        self.assertEqual(dirty["motivo_sujeira"].tolist(), [
+            "amount_invalido", "amount_invalido", "child_invalido"
+        ])
+        self.assertNotIn("Payment Volume", base.columns)
+        self.assertEqual(
+            base["Total Amount Due"].sum() + dirty["Total Amount Due"].sum(),
+            df["Total Amount Due"].sum(),
         )
 
-    if "Child" in ajustes_df.columns:
-        print(
-            f"Child nulo: "
-            f"{ajustes_df['Child'].isna().sum():,}"
-        )
+    def test_empty_input_retains_headers(self):
+        treated, dirty = main.process_dataframe(pd.DataFrame(columns=sorted(main.REQUIRED_COLUMNS)))
+        self.assertIn("child_original", treated.columns)
+        self.assertIn("motivo_sujeira", dirty.columns)
+        self.assertIn("ocorrencias_chave", main.find_duplicate_candidates(treated).columns)
 
-
-def analyze_removed_rows(
-    base_df: pd.DataFrame,
-    ajustes_df: pd.DataFrame,
-) -> None:
-    print("\n" + "=" * 100)
-    print("REGISTROS REMOVIDOS")
-    print("=" * 100)
-
-    base_df = build_key(base_df)
-    ajustes_df = build_key(ajustes_df)
-
-    removed_df = ajustes_df[
-        ~ajustes_df["_key"].isin(base_df["_key"])
-    ].copy()
-
-    print(
-        f"Registros removidos: "
-        f"{len(removed_df):,}"
-    )
-
-    if removed_df.empty:
-        return
-
-    print("\nTOP 20 REMOVIDOS\n")
-
-    cols = [
-        col
-        for col in [
-            "Child",
-            "MID",
-            "Product Description",
-            "Total Amount Due",
-            "Análise - Etapa 1",
-            "Análise - Etapa 2",
-            "Ajustes mês anterior",
-            "Ajustes mês atual",
-        ]
-        if col in removed_df.columns
-    ]
-
-    print(
-        removed_df[cols]
-        .head(20)
-        .to_string(index=False)
-    )
-
-    if "Product Description" in removed_df.columns:
-        print("\nTOP PRODUTOS REMOVIDOS\n")
-
-        print(
-            removed_df["Product Description"]
-            .value_counts()
-            .head(30)
-            .to_string()
-        )
-
-    if "Child" in removed_df.columns:
-        print("\nTOP CHILDS REMOVIDOS\n")
-
-        print(
-            removed_df["Child"]
-            .value_counts()
-            .head(30)
-            .to_string()
-        )
-
-
-def analyze_sujeira(
-    sujeira_df: pd.DataFrame,
-) -> None:
-    print("\n" + "=" * 100)
-    print("SUJEIRA")
-    print("=" * 100)
-
-    print(
-        f"Linhas sujeira: "
-        f"{len(sujeira_df):,}"
-    )
-
-    print("\nPrimeiras 20 linhas:\n")
-
-    print(
-        sujeira_df.head(20).to_string(index=False)
-    )
-
-
-def main() -> None:
-    base_df, ajustes_df, sujeira_df = load_sheets()
-
-    analyze_counts(
-        base_df,
-        ajustes_df,
-        sujeira_df,
-    )
-
-    analyze_nulls(
-        ajustes_df,
-    )
-
-    analyze_removed_rows(
-        base_df,
-        ajustes_df,
-    )
-
-    analyze_sujeira(
-        sujeira_df,
-    )
-
-
-if __name__ == "__main__":
-    main()
+    def test_schema_validation(self):
+        with self.assertRaisesRegex(ValueError, "Colunas obrigatórias ausentes"):
+            main.process_dataframe(pd.DataFrame({"Child": ["loja"]}))
