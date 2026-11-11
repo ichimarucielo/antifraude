@@ -54,3 +54,45 @@ class ReconciliationTest(unittest.TestCase):
     def test_schema_validation(self):
         with self.assertRaisesRegex(ValueError, "Colunas obrigatórias ausentes"):
             main.process_dataframe(pd.DataFrame({"Child": ["loja"]}))
+
+    def test_read_source_file_parses_delimited_rows_in_single_column_xlsx(self):
+        headers = [
+            "Invoice Number",
+            "Child",
+            "MID",
+            "Product Description",
+            "Total Amount Due",
+        ]
+        for delimiter in (",", ";"):
+            header_row = delimiter.join(headers)
+            data_row = delimiter.join([
+                "INV1",
+                "Loja1",
+                "mid-1",
+                f'"Produto{delimiter} Plus"',
+                "10",
+            ])
+            for layout in ("column_name", "cell"):
+                with (
+                    self.subTest(delimiter=delimiter, layout=layout),
+                    TemporaryDirectory() as directory,
+                ):
+                    source = Path(directory) / "input.xlsx"
+                    if layout == "column_name":
+                        raw = pd.DataFrame({header_row: [data_row]})
+                    else:
+                        raw = pd.DataFrame({"CSV": [header_row, data_row]})
+                    raw.to_excel(source, engine="openpyxl", index=False)
+
+                    parsed = main.read_source_file(source)
+
+                    self.assertEqual(parsed.columns.tolist(), headers)
+                    self.assertEqual(parsed.loc[0, "Invoice Number"], "INV1")
+                    self.assertEqual(
+                        parsed.loc[0, "Product Description"],
+                        f"Produto{delimiter} Plus",
+                    )
+                    self.assertEqual(parsed.loc[0, "Total Amount Due"], "10")
+                    treated, dirty = main.process_dataframe(parsed)
+                    self.assertEqual(len(treated), 1)
+                    self.assertTrue(dirty.empty)

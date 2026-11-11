@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,6 +39,68 @@ def get_input_file() -> Path:
     if len(files) > 1:
         raise ValueError(f"Há mais de um arquivo em {INPUT_FOLDER}. Informe --input-file.")
     return files[0]
+
+
+def _split_delimited_record(value: object, delimiter: str) -> list[str]:
+    return next(csv.reader([str(value)], delimiter=delimiter, strict=True))
+
+
+def read_source_file(input_file: Path) -> pd.DataFrame:
+    df = pd.read_excel(input_file, engine="openpyxl")
+    if len(df.columns) != 1:
+        return df
+
+    column_name = df.columns[0]
+    values = df.iloc[:, 0].tolist()
+    for delimiter in (",", ";"):
+        column_headers = [
+            value.strip().lstrip("\ufeff")
+            for value in _split_delimited_record(column_name, delimiter)
+        ]
+        if REQUIRED_COLUMNS.issubset(column_headers):
+            headers = column_headers
+            data_values = values
+        else:
+            headers = []
+            data_values = []
+            for index, value in enumerate(values):
+                if pd.isna(value) or not str(value).strip():
+                    continue
+                candidate_headers = [
+                    field.strip().lstrip("\ufeff")
+                    for field in _split_delimited_record(value, delimiter)
+                ]
+                if REQUIRED_COLUMNS.issubset(candidate_headers):
+                    headers = candidate_headers
+                    data_values = values[index + 1:]
+                    break
+
+        if not headers:
+            continue
+
+        rows = []
+        for value in data_values:
+            if pd.isna(value) or not str(value).strip():
+                continue
+            row = _split_delimited_record(value, delimiter)
+            if len(row) > len(headers):
+                raise ValueError(
+                    f"Registro com mais campos que o cabeçalho em {input_file}."
+                )
+            rows.append([*row, *([None] * (len(headers) - len(row)))])
+
+        logging.warning(
+            "Arquivo %s detectado como texto separado por '%s'; conversão automática aplicada.",
+            input_file,
+            delimiter,
+        )
+        return pd.DataFrame(rows, columns=headers)
+
+    raise ValueError(
+        f"Não foi possível interpretar o arquivo {input_file}: "
+        "a planilha tem uma coluna e não contém os cabeçalhos obrigatórios "
+        "separados por vírgula ou ponto e vírgula."
+    )
 
 
 def process_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -100,7 +163,7 @@ def run_pipeline(input_file: Path | None = None) -> PipelineResult:
         raise ValueError("O arquivo de entrada deve ser diferente dos arquivos de saída.")
 
     logging.info("Lendo %s", input_file)
-    df = pd.read_excel(input_file, engine="openpyxl")
+    df = read_source_file(input_file)
     treated, dirty = process_dataframe(df)
     duplicates = find_duplicate_candidates(treated)
 

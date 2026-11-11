@@ -16,6 +16,8 @@ python -m unittest discover -s src -v
 
 O script lê a primeira aba. Se houver mais de um Excel em `data/original`, indique o arquivo com `python src/main.py --input-file "caminho/arquivo.xlsx"`. A entrada deve conter `Invoice Number`, `Child`, `MID`, `Product Description` e `Total Amount Due`.
 
+Se um arquivo `.xlsx` tiver apenas uma coluna com linhas CSV, o pipeline tenta identificar e separar automaticamente os campos por vírgula ou ponto e vírgula.
+
 ## Saídas
 
 A execução substitui `data/trabalho/antifraude_trabalho.xlsx` e `data/final/antifraude_vf.xlsx`. Esses caminhos contêm exemplos versionados no Git.
